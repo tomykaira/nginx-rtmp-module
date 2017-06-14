@@ -18,6 +18,7 @@
 
 typedef struct ngx_rtmp_live_ctx_s ngx_rtmp_live_ctx_t;
 typedef struct ngx_rtmp_live_stream_s ngx_rtmp_live_stream_t;
+typedef struct ngx_rtmp_live_chunk_s ngx_rtmp_live_chunk_t;
 
 
 typedef struct {
@@ -28,12 +29,21 @@ typedef struct {
 } ngx_rtmp_live_chunk_stream_t;
 
 
+struct ngx_rtmp_live_chunk_s {
+    ngx_rtmp_header_t                  *h;
+    ngx_chain_t                        *in;
+    ngx_rtmp_live_chunk_t              *next;
+};
+
+
 struct ngx_rtmp_live_ctx_s {
     ngx_rtmp_session_t                 *session;
     ngx_rtmp_live_stream_t             *stream;
     ngx_rtmp_live_ctx_t                *next;
     ngx_uint_t                          ndropped;
     ngx_rtmp_live_chunk_stream_t        cs[2];
+    ngx_rtmp_live_chunk_t              *delayed_buffer;
+    ngx_rtmp_live_chunk_t              *delayed_buffer_end;
     ngx_uint_t                          meta_version;
     ngx_event_t                         idle_evt;
     unsigned                            active:1;
@@ -64,6 +74,7 @@ typedef struct {
     ngx_flag_t                          meta;
     ngx_msec_t                          sync;
     ngx_msec_t                          idle_timeout;
+    ngx_msec_t                          delay;
     ngx_flag_t                          atc;
     ngx_flag_t                          interleave;
     ngx_flag_t                          wait_key;

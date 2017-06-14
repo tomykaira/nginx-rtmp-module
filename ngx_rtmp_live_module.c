@@ -108,6 +108,13 @@ static ngx_command_t  ngx_rtmp_live_commands[] = {
       offsetof(ngx_rtmp_live_app_conf_t, idle_timeout),
       NULL },
 
+    { ngx_string("delay"),
+      NGX_RTMP_MAIN_CONF|NGX_RTMP_SRV_CONF|NGX_RTMP_APP_CONF|NGX_CONF_TAKE1,
+      ngx_rtmp_live_set_msec_slot,
+      NGX_RTMP_APP_CONF_OFFSET,
+      offsetof(ngx_rtmp_live_app_conf_t, delay),
+      NULL },
+
       ngx_null_command
 };
 
@@ -155,6 +162,7 @@ ngx_rtmp_live_create_app_conf(ngx_conf_t *cf)
     lacf->buflen = NGX_CONF_UNSET_MSEC;
     lacf->sync = NGX_CONF_UNSET_MSEC;
     lacf->idle_timeout = NGX_CONF_UNSET_MSEC;
+    lacf->delay = NGX_CONF_UNSET_MSEC;
     lacf->interleave = NGX_CONF_UNSET;
     lacf->wait_key = NGX_CONF_UNSET;
     lacf->wait_video = NGX_CONF_UNSET;
@@ -177,6 +185,7 @@ ngx_rtmp_live_merge_app_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_msec_value(conf->buflen, prev->buflen, 0);
     ngx_conf_merge_msec_value(conf->sync, prev->sync, 300);
     ngx_conf_merge_msec_value(conf->idle_timeout, prev->idle_timeout, 0);
+    ngx_conf_merge_msec_value(conf->delay, prev->delay, 0);
     ngx_conf_merge_value(conf->interleave, prev->interleave, 0);
     ngx_conf_merge_value(conf->wait_key, prev->wait_key, 1);
     ngx_conf_merge_value(conf->wait_video, prev->wait_video, 0);
@@ -306,6 +315,11 @@ ngx_rtmp_live_set_status(ngx_rtmp_session_t *s, ngx_chain_t *control,
     if (ctx->publishing) {
 
         /* publisher */
+
+
+        ngx_log_error(NGX_LOG_INFO, s->connection->log, 0,
+                      "ngx_rtmp_live_set_status: delay:%d",
+                      lacf->delay);
 
         if (lacf->idle_timeout) {
             e = &ctx->idle_evt;
@@ -692,6 +706,19 @@ next:
     return next_pause(s, v);
 }
 
+static ngx_rtmp_header_t *clone_ngx_rtmp_header(ngx_rtmp_header_t *src, ngx_log_t *log) {
+    ngx_rtmp_header_t *dst = ngx_alloc(sizeof(ngx_rtmp_header_t), log);
+    if (dst == NULL) {
+        return dst;
+    }
+    dst->csid = src->csid;
+    dst->timestamp = src->timestamp;
+    dst->mlen = src->mlen;
+    dst->type = src->type;
+    dst->msid = src->msid;
+    return dst;
+}
+
 static ngx_int_t
 ngx_rtmp_live_av(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h,
                  ngx_chain_t *in)
@@ -711,6 +738,7 @@ ngx_rtmp_live_av(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h,
     ngx_uint_t                      csidx;
     uint32_t                        delta;
     ngx_rtmp_live_chunk_stream_t   *cs;
+    ngx_rtmp_live_chunk_t          *top_chunk, *end_chunk;
 #ifdef NGX_DEBUG
     const char                     *type_s;
 
@@ -751,6 +779,37 @@ ngx_rtmp_live_av(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h,
 
     s->current_time = h->timestamp;
 
+    cscf = ngx_rtmp_get_module_srv_conf(s, ngx_rtmp_core_module);
+
+    if (ctx->delayed_buffer) {
+        end_chunk = ngx_calloc(sizeof(ngx_rtmp_live_chunk_t), s->connection->log);
+        if (end_chunk == NULL) {
+            return NGX_ERROR;
+        }
+        ctx->delayed_buffer_end->next = end_chunk;
+        ctx->delayed_buffer_end = end_chunk;
+    } else {
+        end_chunk = ngx_calloc(sizeof(ngx_rtmp_live_chunk_t), s->connection->log);
+        if (end_chunk == NULL) {
+            return NGX_ERROR;
+        }
+        ctx->delayed_buffer = end_chunk;
+        ctx->delayed_buffer_end = end_chunk;
+    }
+    end_chunk->h = clone_ngx_rtmp_header(h, s->connection->log);
+    end_chunk->in = ngx_rtmp_append_shared_bufs(cscf, NULL, in);
+
+    top_chunk = ctx->delayed_buffer;
+
+    if (s->current_time - top_chunk->h->timestamp > lacf->delay) {
+        h = top_chunk->h;
+        in = top_chunk->in;
+        ctx->delayed_buffer = ctx->delayed_buffer->next;
+        ngx_free(top_chunk);
+    } else {
+        return NGX_OK;
+    }
+
     peers = 0;
     apkt = NULL;
     aapkt = NULL;
@@ -763,8 +822,6 @@ ngx_rtmp_live_av(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h,
 
     prio = (h->type == NGX_RTMP_MSG_VIDEO ?
             ngx_rtmp_get_video_frame_type(in) : 0);
-
-    cscf = ngx_rtmp_get_module_srv_conf(s, ngx_rtmp_core_module);
 
     csidx = !(lacf->interleave || h->type == NGX_RTMP_MSG_VIDEO);
 
@@ -1023,6 +1080,14 @@ ngx_rtmp_live_av(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h,
 
     if (acopkt) {
         ngx_rtmp_free_shared_chain(cscf, acopkt);
+    }
+
+    if (h) {
+        ngx_free(h);
+    }
+
+    if (in) {
+        ngx_rtmp_free_shared_chain(cscf, in);
     }
 
     ngx_rtmp_update_bandwidth(&ctx->stream->bw_in, h->mlen);
